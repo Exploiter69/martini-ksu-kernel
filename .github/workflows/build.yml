@@ -135,6 +135,190 @@ jobs:
           grep -Eq "^int path_umount\\(struct path \\*path, int flags\\);" fs/internal.h
           echo "SUCCESS: path_umount implementation and fs/internal.h declaration verified."
 
+      - name: Fix Oplus Touchscreen Name Buffer
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          HEADER="drivers/input/touchscreen/oplus_touchscreen_v2/touchpanel_common.h"
+          grep -q '^#define TP_NAME_SIZE_MAX 25          test -f arch/arm64/configs/vendor/lahaina-qgki_defconfig
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 vendor/lahaina-qgki_defconfig
+          ./scripts/config --file out/.config \
+            -e KSU \
+            -e KPROBES \
+            -e HAVE_KPROBES \
+            -e KPROBE_EVENTS \
+            -e OVERLAY_FS \
+            -d MODULE_SIG_FORCE \
+            -d MODULE_SIG_PROTECT \
+            -d LOCALVERSION_AUTO \
+            --set-str LOCALVERSION "-qgki-g${{ inputs.kernel_commit }}"
+          if grep -q "KSU_KPROBE_HOOKS" drivers/kernelsu/Kconfig; then
+            ./scripts/config --file out/.config -e KSU_KPROBE_HOOKS
+          fi
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+          grep -q "^CONFIG_KSU=y" out/.config
+          grep -q "^CONFIG_KPROBES=y" out/.config
+          grep -q "^CONFIG_LOCALVERSION=\"-qgki-g${{ inputs.kernel_commit }}\"" out/.config
+          echo "SUCCESS: out/.config validated."
+
+      - name: Compile Kernel Image (Pure LLVM)
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          touch .scmversion
+          make -j$(nproc --all) O=out \
+            ARCH=arm64 \
+            SUBARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LOCALVERSION="-qgki-g${{ inputs.kernel_commit }}" \
+            Image
+          test -f out/arch/arm64/boot/Image
+          llvm-nm out/vmlinux | grep -q " T path_umount"
+          echo "Verified: path_umount symbol is compiled into vmlinux!"
+          strings out/arch/arm64/boot/Image | grep -E "5\\.4\\.302-qgki-g${{ inputs.kernel_commit }}"
+
+      - name: Package & Validate AnyKernel3 Zip
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3/
+          cat << 'EOF' > AnyKernel3/anykernel.sh
+          ### AnyKernel3 Ramdisk Mod Script
+          ## osm0sis @ xda-developers
+
+          properties() { '
+          kernel.string=KernelSU-Next Legacy for OnePlus 9RT (LineageOS 24.0)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=martini
+          device.name2=OnePlus9RT
+          device.name3=MT2110
+          device.name4=MT2111
+          supported.versions=
+          supported.patchlevels=
+          '; }
+
+          block=/dev/block/bootdevice/by-name/boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+
+          . tools/ak3-core.sh;
+          dump_boot;
+          write_boot;
+          EOF
+          bash -n AnyKernel3/anykernel.sh
+          cd AnyKernel3
+          rm -rf .git README.md *placeholder
+          ZIP_NAME="KSUN-Lineage24-martini-5.4.302-g${{ inputs.kernel_commit }}.zip"
+          zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" *
+          unzip -t "$GITHUB_WORKSPACE/$ZIP_NAME"
+          unzip -l "$GITHUB_WORKSPACE/$ZIP_NAME" | grep -q "Image"
+          unzip -l "$GITHUB_WORKSPACE/$ZIP_NAME" | grep -q "META-INF/com/google/android/update-binary"
+
+      - name: Upload Verified Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KSUN-Lineage24-martini-${{ inputs.kernel_commit }}
+          path: KSUN-Lineage24-martini-5.4.302-g${{ inputs.kernel_commit }}.zip
+ "$HEADER"
+          sed -i 's/^#define TP_NAME_SIZE_MAX 25$/#define TP_NAME_SIZE_MAX 32/' "$HEADER"
+          grep -q '^#define TP_NAME_SIZE_MAX 32          test -f arch/arm64/configs/vendor/lahaina-qgki_defconfig
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 vendor/lahaina-qgki_defconfig
+          ./scripts/config --file out/.config \
+            -e KSU \
+            -e KPROBES \
+            -e HAVE_KPROBES \
+            -e KPROBE_EVENTS \
+            -e OVERLAY_FS \
+            -d MODULE_SIG_FORCE \
+            -d MODULE_SIG_PROTECT \
+            -d LOCALVERSION_AUTO \
+            --set-str LOCALVERSION "-qgki-g${{ inputs.kernel_commit }}"
+          if grep -q "KSU_KPROBE_HOOKS" drivers/kernelsu/Kconfig; then
+            ./scripts/config --file out/.config -e KSU_KPROBE_HOOKS
+          fi
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+          grep -q "^CONFIG_KSU=y" out/.config
+          grep -q "^CONFIG_KPROBES=y" out/.config
+          grep -q "^CONFIG_LOCALVERSION=\"-qgki-g${{ inputs.kernel_commit }}\"" out/.config
+          echo "SUCCESS: out/.config validated."
+
+      - name: Compile Kernel Image (Pure LLVM)
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          touch .scmversion
+          make -j$(nproc --all) O=out \
+            ARCH=arm64 \
+            SUBARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LOCALVERSION="-qgki-g${{ inputs.kernel_commit }}" \
+            Image
+          test -f out/arch/arm64/boot/Image
+          llvm-nm out/vmlinux | grep -q " T path_umount"
+          echo "Verified: path_umount symbol is compiled into vmlinux!"
+          strings out/arch/arm64/boot/Image | grep -E "5\\.4\\.302-qgki-g${{ inputs.kernel_commit }}"
+
+      - name: Package & Validate AnyKernel3 Zip
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3/
+          cat << 'EOF' > AnyKernel3/anykernel.sh
+          ### AnyKernel3 Ramdisk Mod Script
+          ## osm0sis @ xda-developers
+
+          properties() { '
+          kernel.string=KernelSU-Next Legacy for OnePlus 9RT (LineageOS 24.0)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=martini
+          device.name2=OnePlus9RT
+          device.name3=MT2110
+          device.name4=MT2111
+          supported.versions=
+          supported.patchlevels=
+          '; }
+
+          block=/dev/block/bootdevice/by-name/boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+
+          . tools/ak3-core.sh;
+          dump_boot;
+          write_boot;
+          EOF
+          bash -n AnyKernel3/anykernel.sh
+          cd AnyKernel3
+          rm -rf .git README.md *placeholder
+          ZIP_NAME="KSUN-Lineage24-martini-5.4.302-g${{ inputs.kernel_commit }}.zip"
+          zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" *
+          unzip -t "$GITHUB_WORKSPACE/$ZIP_NAME"
+          unzip -l "$GITHUB_WORKSPACE/$ZIP_NAME" | grep -q "Image"
+          unzip -l "$GITHUB_WORKSPACE/$ZIP_NAME" | grep -q "META-INF/com/google/android/update-binary"
+
+      - name: Upload Verified Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KSUN-Lineage24-martini-${{ inputs.kernel_commit }}
+          path: KSUN-Lineage24-martini-5.4.302-g${{ inputs.kernel_commit }}.zip
+ "$HEADER"
+          echo "Fixed TP_NAME_SIZE_MAX: 25 -> 32 to fit lcd_trigger_load_tp_fw_wq%d."
+
       - name: Generate & Validate Kernel Config
         working-directory: kernel
         run: |
