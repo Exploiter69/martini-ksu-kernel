@@ -1,0 +1,229 @@
+name: Build KernelSU-Next (LineageOS 24.0 martini - Hardened)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_commit:
+        description: 'Exact LineageOS Kernel Git Commit Hash (after -g in Settings)'
+        required: true
+        default: '187d13cd30e2'
+      ksu_branch:
+        description: 'KernelSU-Next branch/tag (use legacy for 5.4 non-GKI)'
+        required: true
+        default: 'legacy'
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Maximize Build Space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc "/usr/local/share/boost" "$AGENT_TOOLSDIRECTORY"
+          df -h
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib \
+            git gnupg gperf lib32ncurses5-dev lib32readline-dev lib32z1-dev \
+            liblz4-tool libncurses5 libncurses5-dev libsdl1.2-dev libssl-dev \
+            libxml2 libxml2-utils lzop rsync schedtool squashfs-tools xsltproc \
+            zip zlib1g-dev python-is-python3 cpio device-tree-compiler pahole \
+            binutils-aarch64-linux-gnu
+
+      - name: Clone & Verify Exact LineageOS sm8350 Kernel Commit
+        run: |
+          set -euo pipefail
+          git clone https://github.com/LineageOS/android_kernel_oneplus_sm8350.git kernel
+          cd kernel
+          git checkout "${{ inputs.kernel_commit }}"
+          ACTUAL_HASH=$(git rev-parse --short=12 HEAD)
+          echo "Checked out commit: $ACTUAL_HASH"
+          if [[ "$ACTUAL_HASH" != "${{ inputs.kernel_commit }}"* ]]; then
+            echo "ERROR: Checked out commit ($ACTUAL_HASH) does not match requested (${{ inputs.kernel_commit }})"
+            exit 1
+          fi
+          head -n 5 Makefile
+          grep -q "^VERSION = 5" Makefile
+          grep -q "^PATCHLEVEL = 4" Makefile
+
+      - name: Clone & Verify AOSP Clang Toolchain
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://gitlab.com/crdroidandroid/android_prebuilts_clang_host_linux-x86_clang-r510928.git clang
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          for bin in clang ld.lld llvm-ar llvm-nm llvm-objcopy llvm-objdump llvm-strip; do
+            if ! command -v "$bin" >/dev/null 2>&1; then
+              echo "ERROR: Required toolchain binary '$bin' is missing!"
+              exit 1
+            fi
+          done
+          clang --version
+
+      - name: Integrate & Verify KernelSU-Next (Legacy)
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "${{ inputs.ksu_branch }}"
+          test -e drivers/kernelsu/Kconfig
+          echo "--- Available KernelSU Kconfig symbols ---"
+          cat drivers/kernelsu/Kconfig
+          grep -q "config KSU" drivers/kernelsu/Kconfig
+
+      - name: Deterministic path_umount Backport & Verification
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          if grep -q "path_umount" drivers/kernelsu/Makefile 2>/dev/null; then
+            echo "Note: KernelSU-Next Makefile contains auto-patch logic for path_umount."
+          fi
+          if ! grep -Eq "^int path_umount\\(" fs/namespace.c; then
+            echo "Injecting upstream path_umount() into fs/namespace.c..."
+            python3 - << 'EOF'
+          with open("fs/namespace.c", "r") as f:
+              content = f.read()
+
+          target = "int ksys_umount(char __user *name, int flags)"
+          backport = """static int can_umount(const struct path *path, int flags)
+          {
+          \tstruct mount *mnt = real_mount(path->mnt);
+          \tif (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
+          \t\treturn -EINVAL;
+          \tif (!may_mount())
+          \t\treturn -EPERM;
+          \tif (path->dentry != path->mnt->mnt_root)
+          \t\treturn -EINVAL;
+          \tif (!check_mnt(mnt))
+          \t\treturn -EINVAL;
+          \tif (mnt->mnt.mnt_flags & MNT_LOCKED) /* Check optimistically */
+          \t\treturn -EINVAL;
+          \tif (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
+          \t\treturn -EPERM;
+          \treturn 0;
+          }
+
+          int path_umount(struct path *path, int flags)
+          {
+          \tstruct mount *mnt = real_mount(path->mnt);
+          \tint ret;
+          \tret = can_umount(path, flags);
+          \tif (!ret)
+          \t\tret = do_umount(mnt, flags);
+          \t/* we mustn't call path_put() as that would clear mnt_expiry_mark */
+          \tdput(path->dentry);
+          \tmntput_no_expire(mnt);
+          \treturn ret;
+          }
+
+          """
+          if target not in content:
+              raise SystemExit("FATAL: Anchor 'int ksys_umount' not found in fs/namespace.c!")
+          content = content.replace(target, backport + target, 1)
+          with open("fs/namespace.c", "w") as f:
+              f.write(content)
+          EOF
+          fi
+          if ! grep -Eq "int path_umount\\(" fs/internal.h; then
+            echo "Declaring path_umount() in fs/internal.h..."
+            sed -i '/^extern void __init mnt_init/a int path_umount(struct path *path, int flags);' fs/internal.h
+          fi
+          if ! grep -Eq "int path_umount\\(" include/linux/fs.h; then
+            sed -i '/^extern struct files_struct init_files;/a int path_umount(struct path *path, int flags);' include/linux/fs.h
+          fi
+          grep -Eq "^int path_umount\\(struct path \\*path, int flags\\)" fs/namespace.c
+          grep -Eq "^int path_umount\\(struct path \\*path, int flags\\);" fs/internal.h
+          echo "SUCCESS: path_umount implementation and fs/internal.h declaration verified."
+
+      - name: Generate & Validate Kernel Config
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          test -f arch/arm64/configs/vendor/lahaina-qgki_defconfig
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 vendor/lahaina-qgki_defconfig
+          ./scripts/config --file out/.config \
+            -e KSU \
+            -e KPROBES \
+            -e HAVE_KPROBES \
+            -e KPROBE_EVENTS \
+            -e OVERLAY_FS \
+            -d MODULE_SIG_FORCE \
+            -d MODULE_SIG_PROTECT \
+            -d LOCALVERSION_AUTO \
+            --set-str LOCALVERSION "-qgki-g${{ inputs.kernel_commit }}"
+          if grep -q "KSU_KPROBE_HOOKS" drivers/kernelsu/Kconfig; then
+            ./scripts/config --file out/.config -e KSU_KPROBE_HOOKS
+          fi
+          make O=out ARCH=arm64 LLVM=1 LLVM_IAS=1 olddefconfig
+          grep -q "^CONFIG_KSU=y" out/.config
+          grep -q "^CONFIG_KPROBES=y" out/.config
+          grep -q "^CONFIG_LOCALVERSION=\"-qgki-g${{ inputs.kernel_commit }}\"" out/.config
+          echo "SUCCESS: out/.config validated."
+
+      - name: Compile Kernel Image (Pure LLVM)
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          touch .scmversion
+          make -j$(nproc --all) O=out \
+            ARCH=arm64 \
+            SUBARCH=arm64 \
+            LLVM=1 \
+            LLVM_IAS=1 \
+            CROSS_COMPILE=aarch64-linux-gnu- \
+            LOCALVERSION="-qgki-g${{ inputs.kernel_commit }}" \
+            Image
+          test -f out/arch/arm64/boot/Image
+          llvm-nm out/vmlinux | grep -q " T path_umount"
+          echo "Verified: path_umount symbol is compiled into vmlinux!"
+          strings out/arch/arm64/boot/Image | grep -E "5\\.4\\.302-qgki-g${{ inputs.kernel_commit }}"
+
+      - name: Package & Validate AnyKernel3 Zip
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3/
+          cat << 'EOF' > AnyKernel3/anykernel.sh
+          ### AnyKernel3 Ramdisk Mod Script
+          ## osm0sis @ xda-developers
+
+          properties() { '
+          kernel.string=KernelSU-Next Legacy for OnePlus 9RT (LineageOS 24.0)
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=martini
+          device.name2=OnePlus9RT
+          device.name3=MT2110
+          device.name4=MT2111
+          supported.versions=
+          supported.patchlevels=
+          '; }
+
+          block=/dev/block/bootdevice/by-name/boot;
+          is_slot_device=1;
+          ramdisk_compression=auto;
+          patch_vbmeta_flag=auto;
+
+          . tools/ak3-core.sh;
+          dump_boot;
+          write_boot;
+          EOF
+          bash -n AnyKernel3/anykernel.sh
+          cd AnyKernel3
+          rm -rf .git README.md *placeholder
+          ZIP_NAME="KSUN-Lineage24-martini-5.4.302-g${{ inputs.kernel_commit }}.zip"
+          zip -r9 "$GITHUB_WORKSPACE/$ZIP_NAME" *
+          unzip -t "$GITHUB_WORKSPACE/$ZIP_NAME"
+          unzip -l "$GITHUB_WORKSPACE/$ZIP_NAME" | grep -q "Image"
+          unzip -l "$GITHUB_WORKSPACE/$ZIP_NAME" | grep -q "META-INF/com/google/android/update-binary"
+
+      - name: Upload Verified Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KSUN-Lineage24-martini-${{ inputs.kernel_commit }}
+          path: KSUN-Lineage24-martini-5.4.302-g${{ inputs.kernel_commit }}.zip
